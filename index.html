@@ -2,205 +2,581 @@
 <html lang="it">
 <head>
   <meta charset="UTF-8" />
-  <title>AR Room Scanner – WebXR + three.js</title>
+  <title>Visual Room Scanner – OpenCV.js + three.js</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <style>
     body {
       margin: 0;
-      overflow: hidden;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: #000;
-      color: #fff;
+      color: #eee;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow: hidden;
     }
-    #overlay {
+    #ui {
       position: absolute;
-      top: 10px;
-      left: 10px;
-      right: 10px;
+      top: 8px;
+      left: 8px;
       z-index: 10;
-      padding: 10px 12px;
-      background: rgba(0, 0, 0, 0.55);
+      background: rgba(0, 0, 0, 0.7);
+      padding: 8px 10px;
       border-radius: 8px;
-      font-size: 13px;
+      font-size: 12px;
+      max-width: 360px;
       line-height: 1.3;
     }
-    #overlay h1 {
+    #ui h1 {
       margin: 0 0 4px 0;
-      font-size: 16px;
+      font-size: 15px;
     }
-    #overlay p {
-      margin: 3px 0;
+    #ui p {
+      margin: 2px 0;
     }
     #status {
       margin-top: 4px;
-      font-size: 12px;
       color: #ccc;
+      font-size: 11px;
+    }
+
+    #container {
+      display: flex;
+      flex-direction: row;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    #leftPanel, #rightPanel {
+      flex: 1;
+      position: relative;
+    }
+
+    #videoContainer {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+    }
+
+    #videoCanvas {
+      max-width: 100%;
+      max-height: 100%;
+      border: 1px solid #333;
+    }
+
+    #threeContainer {
+      position: absolute;
+      inset: 0;
+    }
+
+    #controls {
+      margin-top: 4px;
+    }
+    #controls button {
+      padding: 4px 8px;
+      margin-right: 6px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      font-size: 11px;
     }
   </style>
 </head>
 <body>
-  <div id="overlay">
-    <h1>AR Room Scanner (beta)</h1>
+  <div id="ui">
+    <h1>Visual Room Scanner (beta)</h1>
     <p>
-      Premi il pulsante <b>Enter AR</b> (in basso) e muoviti lentamente
-      nell’ambiente guardando muri, pavimento e oggetti.
+      Punta la camera verso pareti / oggetti e muoviti lentamente nello spazio.<br>
+      Il sistema traccia i punti tra i frame, stima il movimento della camera e
+      triangola una nuvola di punti 3D.
     </p>
     <p>
-      Piccoli punti colorati verranno “ancorati” alle superfici, creando
-      una nuvola di punti 3D.
+      Funziona anche senza ARCore/WebXR. È un prototipo di ricerca, non perfetto 🙂
     </p>
-    <p>
-      Funziona su <b>Chrome Android</b> con supporto ARCore/WebXR.
-    </p>
-    <div id="status">Inizializzazione...</div>
+    <div id="controls">
+      <button id="resetBtn">Reset cloud</button>
+    </div>
+    <div id="status">Caricamento librerie...</div>
   </div>
 
-  <!-- three.js + ARButton come ES modules (URL completi, vanno bene su GitHub Pages) -->
-  <script type="module">
-    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
-    import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
+  <div id="container">
+    <div id="leftPanel">
+      <div id="videoContainer">
+        <canvas id="videoCanvas"></canvas>
+      </div>
+    </div>
+    <div id="rightPanel">
+      <div id="threeContainer"></div>
+    </div>
+  </div>
 
+  <!-- OpenCV.js (global, async) -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" type="text/javascript"></script>
+
+  <!-- three.js + OrbitControls (global, versione compatibile) -->
+  <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+  <script>
+    // ==============================
+    // VARIABILI GLOBALI
+    // ==============================
     const statusEl = document.getElementById('status');
+    const resetBtn = document.getElementById('resetBtn');
 
-    // ==========================
-    // SCENA AR DI BASE
-    // ==========================
-    const scene = new THREE.Scene();
+    let video = null;
+    let videoCanvas = null;
+    let videoCtx = null;
+    let streaming = false;
 
-    const camera = new THREE.PerspectiveCamera(
-      70,
-      window.innerWidth / window.innerHeight,
-      0.01,
-      20
-    );
+    let cvReady = false;
 
-    const renderer = new THREE.WebGLRenderer({
-      antialias: true,
-      alpha: true
-    });
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.xr.enabled = true;
-    document.body.appendChild(renderer.domElement);
+    // OpenCV
+    let frameRGBA = null;
+    let gray = null;
+    let prevGray = null;
 
-    // Un po' di luce (anche se i Points non ne hanno bisogno)
-    const ambient = new THREE.AmbientLight(0xffffff, 0.5);
-    scene.add(ambient);
+    let prevPts = null;     // punti (prev frame)
+    let currPts = null;     // punti (curr frame)
+    let status = null;      // status optical flow
+    let err = null;
 
-    // ==========================
-    // PUNTI DELLA SCANSIONE
-    // ==========================
-    const maxPoints = 8000;
-    const positions = new Float32Array(maxPoints * 3);
+    let frameCount = 0;
+    const PROCESS_EVERY_N_FRAMES = 2; // per alleggerire
+
+    // Camera intrinsics (approssimati)
+    let focal = 800;
+    let pp = null;          // principal point [cx, cy]
+
+    // Pose cumulativa della camera (R, t)
+    let R_cumulative = null;
+    let t_cumulative = null;
+
+    // three.js
+    let renderer, scene, camera3D, controls;
+    let pointGeom, pointMat, pointCloud;
+    let maxPoints = 20000;
+    let positions = null;
     let pointCount = 0;
-    let lastAdded = null;
 
-    const pointGeom = new THREE.BufferGeometry();
-    pointGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    pointGeom.setDrawRange(0, 0);
-
-    const pointMat = new THREE.PointsMaterial({
-      size: 0.015,
-      color: 0x00ffcc,
-      sizeAttenuation: true
-    });
-
-    const pointCloud = new THREE.Points(pointGeom, pointMat);
-    scene.add(pointCloud);
-
-    function addScanPoint(x, y, z) {
-      if (pointCount >= maxPoints) return;
-
-      // Evita di inserire punti troppo vicini all'ultimo (per non saturare)
-      if (lastAdded) {
-        const dx = x - lastAdded.x;
-        const dy = y - lastAdded.y;
-        const dz = z - lastAdded.z;
-        const dist2 = dx*dx + dy*dy + dz*dz;
-        // soglia ~ 2cm
-        if (dist2 < 0.0004) return;
+    // ==============================
+    // ATTENDI OPENCV
+    // ==============================
+    function waitForOpenCv() {
+      if (window.cv && typeof cv.Mat === 'function') {
+        cvReady = true;
+        statusEl.textContent = 'OpenCV pronto. Inizializzo video...';
+      } else {
+        setTimeout(waitForOpenCv, 100);
       }
+    }
 
+    // ==============================
+    // INIT VIDEO
+    // ==============================
+    function initVideo() {
+      video = document.createElement('video');
+      video.setAttribute('autoplay', true);
+      video.setAttribute('playsinline', true);
+
+      videoCanvas = document.getElementById('videoCanvas');
+      videoCtx = videoCanvas.getContext('2d');
+
+      const constraints = {
+        video: {
+          facingMode: { ideal: 'environment' }  // preferisci camera posteriore
+        },
+        audio: false
+      };
+
+      navigator.mediaDevices.getUserMedia(constraints)
+        .then((stream) => {
+          video.srcObject = stream;
+          video.addEventListener('loadedmetadata', () => {
+            // riduciamo la risoluzione per performance
+            const targetWidth = 320;
+            const ratio = video.videoHeight / video.videoWidth;
+            const targetHeight = Math.round(targetWidth * ratio);
+
+            videoCanvas.width = targetWidth;
+            videoCanvas.height = targetHeight;
+
+            streaming = true;
+            statusEl.textContent = 'Camera attiva. Inizio tracking...';
+
+            // Inizializza intrinsics approssimati
+            focal = targetWidth; // focal ≈ width (approssimazione)
+            pp = new cv.Point(targetWidth / 2, targetHeight / 2);
+          });
+        })
+        .catch((err) => {
+          console.error('Errore getUserMedia:', err);
+          statusEl.textContent = 'Errore accesso camera: ' + err;
+        });
+    }
+
+    // ==============================
+    // INIT THREE.JS
+    // ==============================
+    function initThree() {
+      const container = document.getElementById('threeContainer');
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(renderer.domElement);
+
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x000000);
+
+      camera3D = new THREE.PerspectiveCamera(
+        60,
+        container.clientWidth / container.clientHeight,
+        0.01,
+        100
+      );
+      camera3D.position.set(0, 0, 2);
+
+      controls = new THREE.OrbitControls(camera3D, renderer.domElement);
+      controls.target.set(0, 0, 0);
+      controls.update();
+
+      const ambient = new THREE.AmbientLight(0xffffff, 0.5);
+      scene.add(ambient);
+
+      const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+      dir.position.set(1, 2, 1);
+      scene.add(dir);
+
+      // Punto di origine (0,0,0)
+      const originGeom = new THREE.SphereGeometry(0.02, 16, 16);
+      const originMat = new THREE.MeshStandardMaterial({ color: 0xff4444 });
+      const originSphere = new THREE.Mesh(originGeom, originMat);
+      scene.add(originSphere);
+
+      // Griglia di riferimento
+      const grid = new THREE.GridHelper(2, 20, 0x444444, 0x222222);
+      scene.add(grid);
+
+      // Point cloud
+      positions = new Float32Array(maxPoints * 3);
+      pointGeom = new THREE.BufferGeometry();
+      pointGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      pointGeom.setDrawRange(0, 0);
+
+      pointMat = new THREE.PointsMaterial({
+        size: 0.015,
+        color: 0x00ffcc,
+        sizeAttenuation: true
+      });
+
+      pointCloud = new THREE.Points(pointGeom, pointMat);
+      scene.add(pointCloud);
+
+      window.addEventListener('resize', onWindowResize);
+      animateThree();
+    }
+
+    function onWindowResize() {
+      const container = document.getElementById('threeContainer');
+      camera3D.aspect = container.clientWidth / container.clientHeight;
+      camera3D.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    }
+
+    function animateThree() {
+      requestAnimationFrame(animateThree);
+      controls.update();
+      renderer.render(scene, camera3D);
+    }
+
+    function resetPointCloud() {
+      pointCount = 0;
+      pointGeom.setDrawRange(0, 0);
+      pointGeom.attributes.position.needsUpdate = true;
+      statusEl.textContent = 'Nuvola di punti resettata. Continua a muoverti per scansionare.';
+    }
+
+    resetBtn.addEventListener('click', resetPointCloud);
+
+    function add3DPoint(x, y, z) {
+      if (pointCount >= maxPoints) return;
       const i = pointCount * 3;
       positions[i]     = x;
       positions[i + 1] = y;
       positions[i + 2] = z;
-
       pointCount++;
       pointGeom.attributes.position.needsUpdate = true;
       pointGeom.setDrawRange(0, pointCount);
-
-      lastAdded = { x, y, z };
     }
 
-    // ==========================
-    // WEBXR / AR BUTTON
-    // ==========================
-    const arButton = ARButton.createButton(renderer, {
-      requiredFeatures: ['hit-test'],     // richiediamo hit-test
-      optionalFeatures: ['dom-overlay'],
-      domOverlay: { root: document.body } // così l'overlay rimane visibile in AR
-    });
-    document.body.appendChild(arButton);
+    // ==============================
+    // MAIN LOOP (VIDEO + OPENCV)
+    // ==============================
+    function mainLoop() {
+      requestAnimationFrame(mainLoop);
 
-    // ==========================
-    // HIT TEST (per "vedere" le superfici)
-    // ==========================
-    let hitTestSource = null;
-    let hitTestSourceRequested = false;
+      if (!streaming || !cvReady) return;
 
-    renderer.setAnimationLoop(onXRFrame);
+      frameCount++;
+      // Disegna frame corrente nel canvas (ridotto)
+      videoCtx.drawImage(video, 0, 0, videoCanvas.width, videoCanvas.height);
 
-    function onXRFrame(timestamp, frame) {
-      const session = renderer.xr.getSession();
+      // Ogni frame N elaboriamo (per alleggerire)
+      if (frameCount % PROCESS_EVERY_N_FRAMES !== 0) {
+        return;
+      }
 
-      if (session && frame) {
-        const referenceSpace = renderer.xr.getReferenceSpace();
+      const width = videoCanvas.width;
+      const height = videoCanvas.height;
+      const imageData = videoCtx.getImageData(0, 0, width, height);
 
-        // Richiedi l'hitTestSource una volta sola per la sessione
-        if (!hitTestSourceRequested) {
-          session.requestReferenceSpace('viewer').then((viewerSpace) => {
-            session.requestHitTestSource({ space: viewerSpace }).then((source) => {
-              hitTestSource = source;
-            });
-          });
+      if (!frameRGBA) {
+        frameRGBA = new cv.Mat(height, width, cv.CV_8UC4);
+        gray = new cv.Mat(height, width, cv.CV_8UC1);
+        prevGray = new cv.Mat(height, width, cv.CV_8UC1);
+        status = new cv.Mat();
+        err = new cv.Mat();
 
-          session.addEventListener('end', () => {
-            hitTestSourceRequested = false;
-            hitTestSource = null;
-            pointCount = 0;
-            pointGeom.setDrawRange(0, 0);
-            statusEl.textContent = 'Sessione AR terminata. Rientra in AR per una nuova scansione.';
-          });
+        // Pose iniziale: R = I, t = 0
+        R_cumulative = cv.Mat.eye(3, 3, cv.CV_64F);
+        t_cumulative = cv.Mat.zeros(3, 1, cv.CV_64F);
+      }
 
-          hitTestSourceRequested = true;
-          statusEl.textContent = 'AR attiva. Muoviti lentamente guardando muri, pavimento e oggetti.';
-        }
+      frameRGBA.data.set(imageData.data);
+      cv.cvtColor(frameRGBA, gray, cv.COLOR_RGBA2GRAY);
 
-        if (hitTestSource) {
-          const hitTestResults = frame.getHitTestResults(hitTestSource);
-          if (hitTestResults.length > 0) {
-            const hit = hitTestResults[0];
-            const pose = hit.getPose(referenceSpace);
+      if (!prevPts) {
+        // Primo frame: rileva caratteristiche buone da tracciare
+        const maxCorners = 300;
+        const qualityLevel = 0.01;
+        const minDistance = 5;
+        const mask = new cv.Mat();
+        const blockSize = 3;
+        const useHarrisDetector = false;
+        const k = 0.04;
 
-            if (pose) {
-              const pos = pose.transform.position;
-              addScanPoint(pos.x, pos.y, pos.z);
-            }
-          }
+        prevPts = new cv.Mat();
+        cv.goodFeaturesToTrack(
+          gray,
+          prevPts,
+          maxCorners,
+          qualityLevel,
+          minDistance,
+          mask,
+          blockSize,
+          useHarrisDetector,
+          k
+        );
+        mask.delete();
+
+        gray.copyTo(prevGray);
+        statusEl.textContent = 'Punti iniziali rilevati. Muoviti lentamente...';
+        return;
+      }
+
+      // Optical flow: traccia i punti dal frame precedente a quello attuale
+      currPts = new cv.Mat();
+      cv.calcOpticalFlowPyrLK(
+        prevGray,
+        gray,
+        prevPts,
+        currPts,
+        status,
+        err
+      );
+
+      // Filtra punti buoni
+      const goodPrev = [];
+      const goodCurr = [];
+
+      for (let i = 0; i < status.rows; i++) {
+        if (status.ucharPtr(i, 0)[0] === 1) {
+          const px = prevPts.floatAt(i, 0);
+          const py = prevPts.floatAt(i, 1);
+          const cx = currPts.floatAt(i, 0);
+          const cy = currPts.floatAt(i, 1);
+          goodPrev.push(px, py);
+          goodCurr.push(cx, cy);
         }
       }
 
-      renderer.render(scene, camera);
+      const nPoints = goodPrev.length / 2;
+
+      if (nPoints < 8) {
+        // Troppo pochi punti → ricalcola da zero
+        prevPts.delete();
+        prevPts = null;
+        currPts.delete();
+        statusEl.textContent = 'Pochi punti da tracciare, ricerco features...';
+        gray.copyTo(prevGray);
+        return;
+      }
+
+      // Crea Mat Nx1 CV_32FC2 per findEssentialMat / recoverPose
+      const prevMat = cv.matFromArray(nPoints, 1, cv.CV_32FC2, goodPrev);
+      const currMat = cv.matFromArray(nPoints, 1, cv.CV_32FC2, goodCurr);
+
+      // Stima Essential Matrix (E) & pose relativa
+      const maskE = new cv.Mat();
+      const E = cv.findEssentialMat(
+        prevMat,
+        currMat,
+        focal,
+        pp,
+        cv.RANSAC,
+        0.999,
+        1.0,
+        maskE
+      );
+
+      if (E.rows === 0 || E.cols === 0) {
+        // pose non stimabile
+        prevMat.delete();
+        currMat.delete();
+        maskE.delete();
+        currPts.delete();
+        gray.copyTo(prevGray);
+        statusEl.textContent = 'Non riesco a stimare il movimento...';
+        return;
+      }
+
+      const R = new cv.Mat();
+      const t = new cv.Mat();
+      const maskPose = new cv.Mat();
+
+      cv.recoverPose(
+        E,
+        prevMat,
+        currMat,
+        R,
+        t,
+        focal,
+        pp,
+        maskPose
+      );
+
+      // Aggiorna la posa cumulativa: [R_cum, t_cum] = [R, t] * [R_cum, t_cum]
+      const R_cum_new = new cv.Mat();
+      cv.gemm(R, R_cumulative, 1, null, 0, R_cum_new); // R * R_cumulative
+
+      const t_cum_new = new cv.Mat();
+      // t_new = R * t_cumulative + t
+      const tmp = new cv.Mat();
+      cv.gemm(R, t_cumulative, 1, null, 0, tmp);
+      cv.add(tmp, t, t_cum_new);
+
+      // Triangolazione: calcola 3D dei punti buoni per questo movimento
+      // Matrice K (intrinsics approssimata)
+      const K = cv.Mat.zeros(3, 3, cv.CV_64F);
+      K.doublePtr(0,0)[0] = focal;
+      K.doublePtr(1,1)[0] = focal;
+      K.doublePtr(0,2)[0] = pp.x;
+      K.doublePtr(1,2)[0] = pp.y;
+      K.doublePtr(2,2)[0] = 1.0;
+
+      // P0 = K [I | 0]
+      const I = cv.Mat.eye(3, 3, cv.CV_64F);
+      const P0 = new cv.Mat(3, 4, cv.CV_64F);
+      const zero3 = cv.Mat.zeros(3, 1, cv.CV_64F);
+      {
+        const Rt0 = new cv.Mat(3, 4, cv.CV_64F);
+        // copia I in Rt0[:, 0:3], zero in Rt0[:, 3]
+        for (let r = 0; r < 3; r++) {
+          for (let c = 0; c < 3; c++) {
+            Rt0.doublePtr(r, c)[0] = I.doublePtr(r, c)[0];
+          }
+          Rt0.doublePtr(r, 3)[0] = 0.0;
+        }
+        cv.gemm(K, Rt0, 1, null, 0, P0);
+        Rt0.delete();
+      }
+
+      // P1 = K [R_cum_new | t_cum_new]
+      const Rt1 = new cv.Mat(3, 4, cv.CV_64F);
+      for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 3; c++) {
+          Rt1.doublePtr(r, c)[0] = R_cum_new.doublePtr(r, c)[0];
+        }
+        Rt1.doublePtr(r, 3)[0] = t_cum_new.doublePtr(r, 0)[0];
+      }
+      const P1 = new cv.Mat(3, 4, cv.CV_64F);
+      cv.gemm(K, Rt1, 1, null, 0, P1);
+
+      const points4D = new cv.Mat();
+      cv.triangulatePoints(P0, P1, prevMat, currMat, points4D);
+
+      // Aggiungi i punti alla nuvola (convertendo da omogenee)
+      for (let i = 0; i < points4D.cols; i++) {
+        const x = points4D.floatAt(0, i);
+        const y = points4D.floatAt(1, i);
+        const z = points4D.floatAt(2, i);
+        const w = points4D.floatAt(3, i);
+
+        if (Math.abs(w) > 1e-5) {
+          const X = x / w;
+          const Y = y / w;
+          const Z = z / w;
+          // scaling: riduciamo un po' le distanze per non avere valori enormi
+          const scale = 0.2;
+          add3DPoint(X * scale, -Y * scale, Z * scale);
+        }
+      }
+
+      // Cleanup
+      E.delete();
+      maskE.delete();
+      R.delete();
+      t.delete();
+      maskPose.delete();
+      K.delete();
+      I.delete();
+      P0.delete();
+      zero3.delete();
+      Rt1.delete();
+      P1.delete();
+      points4D.delete();
+      tmp.delete();
+      R_cumulative.delete();
+      t_cumulative.delete();
+
+      // Aggiorna cumulativi
+      R_cumulative = R_cum_new;
+      t_cumulative = t_cum_new;
+
+      prevMat.delete();
+      currMat.delete();
+
+      prevPts.delete();
+      prevPts = currPts; // le correnti diventano le precedenti
+      gray.copyTo(prevGray);
+
+      statusEl.textContent = `Punti 3D: ${pointCount} | Tracked features: ${nPoints}`;
     }
 
-    // ==========================
-    // RESIZE
-    // ==========================
-    window.addEventListener('resize', () => {
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
+    // ==============================
+    // CLEANUP
+    // ==============================
+    window.addEventListener('beforeunload', () => {
+      if (window.cv) {
+        if (frameRGBA) frameRGBA.delete();
+        if (gray) gray.delete();
+        if (prevGray) prevGray.delete();
+        if (prevPts) prevPts.delete();
+        if (currPts) currPts.delete();
+        if (status) status.delete();
+        if (err) err.delete();
+        if (R_cumulative) R_cumulative.delete();
+        if (t_cumulative) t_cumulative.delete();
+      }
+    });
+
+    // ==============================
+    // AVVIO
+    // ==============================
+    window.addEventListener('load', () => {
+      initThree();
+      initVideo();
+      waitForOpenCv();
+      requestAnimationFrame(mainLoop);
     });
   </script>
 </body>
