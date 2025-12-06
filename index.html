@@ -2,7 +2,7 @@
 <html lang="it">
 <head>
   <meta charset="UTF-8" />
-  <title>Visual Room Scanner – OpenCV.js + three.js</title>
+  <title>Visual Room Scanner – Parallax 3D (OpenCV.js + three.js)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <style>
     body {
@@ -84,14 +84,17 @@
 </head>
 <body>
   <div id="ui">
-    <h1>Visual Room Scanner (beta)</h1>
+    <h1>Visual Room Scanner (parallax 3D)</h1>
     <p>
-      Punta la camera verso pareti / oggetti e muoviti lentamente nello spazio.<br>
-      Il sistema traccia i punti tra i frame, stima il movimento della camera e
-      triangola una nuvola di punti 3D.
+      Punta la camera su pareti / oggetti con texture e muoviti lentamente
+      lateralmente e avanti/indietro.
     </p>
     <p>
-      Funziona anche senza ARCore/WebXR. È un prototipo di ricerca, non perfetto 🙂
+      I punti vengono tracciati tra i frame: più si muovono, più vengono
+      considerati “vicini” in 3D.
+    </p>
+    <p>
+      È un modello 3D qualitativo (non metrico), ma usa davvero il tuo movimento.
     </p>
     <div id="controls">
       <button id="resetBtn">Reset cloud</button>
@@ -136,21 +139,15 @@
     let gray = null;
     let prevGray = null;
 
-    let prevPts = null;     // punti (prev frame)
-    let currPts = null;     // punti (curr frame)
-    let status = null;      // status optical flow
-    let err = null;
+    let prevPts = null;
+    let currPts = null;
+    let ofStatus = null;
+    let ofErr = null;
 
     let frameCount = 0;
-    const PROCESS_EVERY_N_FRAMES = 2; // per alleggerire
+    const PROCESS_EVERY_N_FRAMES = 2; // elabora 1 frame ogni 2
 
-    // Camera intrinsics (approssimati)
-    let focal = 800;
-    let pp = null;          // principal point [cx, cy]
-
-    // Pose cumulativa della camera (R, t)
-    let R_cumulative = null;
-    let t_cumulative = null;
+    let cx = 0, cy = 0; // centro dell'immagine
 
     // three.js
     let renderer, scene, camera3D, controls;
@@ -184,7 +181,7 @@
 
       const constraints = {
         video: {
-          facingMode: { ideal: 'environment' }  // preferisci camera posteriore
+          facingMode: { ideal: 'environment' }
         },
         audio: false
       };
@@ -193,7 +190,6 @@
         .then((stream) => {
           video.srcObject = stream;
           video.addEventListener('loadedmetadata', () => {
-            // riduciamo la risoluzione per performance
             const targetWidth = 320;
             const ratio = video.videoHeight / video.videoWidth;
             const targetHeight = Math.round(targetWidth * ratio);
@@ -201,12 +197,11 @@
             videoCanvas.width = targetWidth;
             videoCanvas.height = targetHeight;
 
-            streaming = true;
-            statusEl.textContent = 'Camera attiva. Inizio tracking...';
+            cx = targetWidth / 2;
+            cy = targetHeight / 2;
 
-            // Inizializza intrinsics approssimati
-            focal = targetWidth; // focal ≈ width (approssimazione)
-            pp = new cv.Point(targetWidth / 2, targetHeight / 2);
+            streaming = true;
+            statusEl.textContent = 'Camera attiva. Muoviti lentamente per generare 3D...';
           });
         })
         .catch((err) => {
@@ -246,13 +241,13 @@
       dir.position.set(1, 2, 1);
       scene.add(dir);
 
-      // Punto di origine (0,0,0)
+      // Origine
       const originGeom = new THREE.SphereGeometry(0.02, 16, 16);
       const originMat = new THREE.MeshStandardMaterial({ color: 0xff4444 });
       const originSphere = new THREE.Mesh(originGeom, originMat);
       scene.add(originSphere);
 
-      // Griglia di riferimento
+      // Griglia
       const grid = new THREE.GridHelper(2, 20, 0x444444, 0x222222);
       scene.add(grid);
 
@@ -263,7 +258,7 @@
       pointGeom.setDrawRange(0, 0);
 
       pointMat = new THREE.PointsMaterial({
-        size: 0.015,
+        size: 0.02,
         color: 0x00ffcc,
         sizeAttenuation: true
       });
@@ -292,7 +287,7 @@
       pointCount = 0;
       pointGeom.setDrawRange(0, 0);
       pointGeom.attributes.position.needsUpdate = true;
-      statusEl.textContent = 'Nuvola di punti resettata. Continua a muoverti per scansionare.';
+      statusEl.textContent = 'Nuvola resettata. Continua a muoverti per raccogliere punti.';
     }
 
     resetBtn.addEventListener('click', resetPointCloud);
@@ -309,289 +304,136 @@
     }
 
     // ==============================
-    // MAIN LOOP (VIDEO + OPENCV)
+    // MAIN LOOP (PARALLAX 3D)
     // ==============================
     function mainLoop() {
-  requestAnimationFrame(mainLoop);
+      requestAnimationFrame(mainLoop);
 
-  if (!streaming || !cvReady) return;
+      if (!streaming || !cvReady) return;
 
-  frameCount++;
+      frameCount++;
 
-  // Disegna il frame corrente sul canvas ridotto
-  videoCtx.drawImage(video, 0, 0, videoCanvas.width, videoCanvas.height);
+      videoCtx.drawImage(video, 0, 0, videoCanvas.width, videoCanvas.height);
 
-  // Per alleggerire: elabora solo 1 frame ogni N
-  if (frameCount % PROCESS_EVERY_N_FRAMES !== 0) {
-    return;
-  }
-
-  const width = videoCanvas.width;
-  const height = videoCanvas.height;
-  const imageData = videoCtx.getImageData(0, 0, width, height);
-
-  if (!frameRGBA) {
-    frameRGBA = new cv.Mat(height, width, cv.CV_8UC4);
-    gray      = new cv.Mat(height, width, cv.CV_8UC1);
-    prevGray  = new cv.Mat(height, width, cv.CV_8UC1);
-    status    = new cv.Mat();
-    err       = new cv.Mat();
-
-    // Pose iniziale: R = I, t = 0
-    R_cumulative = cv.Mat.eye(3, 3, cv.CV_64F);
-    t_cumulative = cv.Mat.zeros(3, 1, cv.CV_64F);
-  }
-
-  frameRGBA.data.set(imageData.data);
-  cv.cvtColor(frameRGBA, gray, cv.COLOR_RGBA2GRAY);
-
-  // --- Primo frame: rileva le feature da tracciare ---
-  if (!prevPts) {
-    const maxCorners = 300;
-    const qualityLevel = 0.01;
-    const minDistance = 5;
-    const mask = new cv.Mat();
-    const blockSize = 3;
-    const useHarrisDetector = false;
-    const k = 0.04;
-
-    prevPts = new cv.Mat();
-    cv.goodFeaturesToTrack(
-      gray,
-      prevPts,
-      maxCorners,
-      qualityLevel,
-      minDistance,
-      mask,
-      blockSize,
-      useHarrisDetector,
-      k
-    );
-    mask.delete();
-
-    gray.copyTo(prevGray);
-    statusEl.textContent = 'Punti iniziali rilevati. Muoviti lentamente...';
-    return;
-  }
-
-  // --- Optical flow: traccia i punti tra prevGray e gray ---
-  currPts = new cv.Mat();
-  cv.calcOpticalFlowPyrLK(
-    prevGray,
-    gray,
-    prevPts,
-    currPts,
-    status,
-    err
-  );
-
-  const goodPrev = [];
-  const goodCurr = [];
-
-  for (let i = 0; i < status.rows; i++) {
-    if (status.ucharPtr(i, 0)[0] === 1) {
-      const px = prevPts.floatAt(i, 0);
-      const py = prevPts.floatAt(i, 1);
-      const cx = currPts.floatAt(i, 0);
-      const cy = currPts.floatAt(i, 1);
-      goodPrev.push(px, py);
-      goodCurr.push(cx, cy);
-    }
-  }
-
-  const nPoints = goodPrev.length / 2;
-
-  if (nPoints < 8) {
-    // Troppo pochi punti → ricalcola features
-    prevPts.delete();
-    prevPts = null;
-    currPts.delete();
-    gray.copyTo(prevGray);
-    statusEl.textContent = 'Pochi punti da tracciare, ricerco nuove features...';
-    return;
-  }
-
-  // --- Crea Mat di punti (Nx1, CV_32FC2) ---
-  const prevMat = cv.matFromArray(nPoints, 1, cv.CV_32FC2, goodPrev);
-  const currMat = cv.matFromArray(nPoints, 1, cv.CV_32FC2, goodCurr);
-
-  // =======================================================
-  // 1) Trova la Fundamental Matrix F (invece di Essential)
-  // =======================================================
-  const maskF = new cv.Mat();
-  const F = cv.findFundamentalMat(
-    prevMat,
-    currMat,
-    cv.FM_RANSAC,
-    1.0,   // soglia RANSAC in pixel
-    0.999, // confidenza
-    2000,  // max iterazioni
-    maskF
-  );
-
-  if (F.rows === 0 || F.cols === 0) {
-    // Movimento non stimabile in modo robusto
-    prevMat.delete();
-    currMat.delete();
-    maskF.delete();
-    currPts.delete();
-    gray.copyTo(prevGray);
-    statusEl.textContent = 'Non riesco a stimare il movimento (F vuota)...';
-    return;
-  }
-
-  // =======================================================
-  // 2) Costruisci Essential Matrix: E = Kᵀ F K
-  // =======================================================
-  // Matrice intrinseca K (approssimata)
-  const K = cv.Mat.zeros(3, 3, cv.CV_64F);
-  K.doublePtr(0,0)[0] = focal;
-  K.doublePtr(1,1)[0] = focal;
-  K.doublePtr(0,2)[0] = pp.x;
-  K.doublePtr(1,2)[0] = pp.y;
-  K.doublePtr(2,2)[0] = 1.0;
-
-  // Assicuriamoci che F sia double
-  const Fd = new cv.Mat();
-  F.convertTo(Fd, cv.CV_64F);
-
-  const Kt = new cv.Mat();
-  cv.transpose(K, Kt);
-
-  const temp = new cv.Mat();
-  cv.gemm(Kt, Fd, 1, null, 0, temp); // temp = Kᵀ * Fd
-
-  const E = new cv.Mat();
-  cv.gemm(temp, K, 1, null, 0, E);   // E = temp * K
-
-  // Non ci servono più questi
-  F.delete();
-  Fd.delete();
-  Kt.delete();
-  temp.delete();
-  maskF.delete();
-  K.delete(); // triangolazione userà un K proprio più avanti
-
-  // =======================================================
-  // 3) Pose relativa: R, t da E
-  // =======================================================
-  const R = new cv.Mat();
-  const t = new cv.Mat();
-  const maskPose = new cv.Mat();
-
-  cv.recoverPose(
-    E,
-    prevMat,
-    currMat,
-    R,
-    t,
-    focal,
-    pp,
-    maskPose
-  );
-
-  E.delete();
-  maskPose.delete();
-
-  // =======================================================
-  // 4) Aggiorna posa cumulativa: [R_cum, t_cum] = [R, t] * [R_cum, t_cum]
-  // =======================================================
-  const R_cum_new = new cv.Mat();
-  cv.gemm(R, R_cumulative, 1, null, 0, R_cum_new); // R * R_cumulative
-
-  const t_cum_new = new cv.Mat();
-  const tmp = new cv.Mat();
-  cv.gemm(R, t_cumulative, 1, null, 0, tmp); // R * t_cumulative
-  cv.add(tmp, t, t_cum_new);                 // + t
-
-  tmp.delete();
-  R.delete();
-  t.delete();
-
-  // =======================================================
-  // 5) Triangolazione punti 3D per questo movimento
-  // =======================================================
-  // Matrice K per la triangolazione (di nuovo, ma va bene)
-  const Ktri = cv.Mat.zeros(3, 3, cv.CV_64F);
-  Ktri.doublePtr(0,0)[0] = focal;
-  Ktri.doublePtr(1,1)[0] = focal;
-  Ktri.doublePtr(0,2)[0] = pp.x;
-  Ktri.doublePtr(1,2)[0] = pp.y;
-  Ktri.doublePtr(2,2)[0] = 1.0;
-
-  const I = cv.Mat.eye(3, 3, cv.CV_64F);
-  const P0 = new cv.Mat(3, 4, cv.CV_64F);
-  const zero3 = cv.Mat.zeros(3, 1, cv.CV_64F);
-
-  // P0 = Ktri [I | 0]
-  {
-    const Rt0 = new cv.Mat(3, 4, cv.CV_64F);
-    for (let r = 0; r < 3; r++) {
-      for (let c = 0; c < 3; c++) {
-        Rt0.doublePtr(r, c)[0] = I.doublePtr(r, c)[0];
+      if (frameCount % PROCESS_EVERY_N_FRAMES !== 0) {
+        return;
       }
-      Rt0.doublePtr(r, 3)[0] = 0.0;
+
+      const width = videoCanvas.width;
+      const height = videoCanvas.height;
+      const imageData = videoCtx.getImageData(0, 0, width, height);
+
+      if (!frameRGBA) {
+        frameRGBA = new cv.Mat(height, width, cv.CV_8UC4);
+        gray      = new cv.Mat(height, width, cv.CV_8UC1);
+        prevGray  = new cv.Mat(height, width, cv.CV_8UC1);
+        ofStatus  = new cv.Mat();
+      }
+
+      frameRGBA.data.set(imageData.data);
+      cv.cvtColor(frameRGBA, gray, cv.COLOR_RGBA2GRAY);
+
+      // Primo frame: trova features
+      if (!prevPts) {
+        const maxCorners = 300;
+        const qualityLevel = 0.01;
+        const minDistance = 5;
+        const mask = new cv.Mat();
+        const blockSize = 3;
+        const useHarrisDetector = false;
+        const k = 0.04;
+
+        prevPts = new cv.Mat();
+        cv.goodFeaturesToTrack(
+          gray,
+          prevPts,
+          maxCorners,
+          qualityLevel,
+          minDistance,
+          mask,
+          blockSize,
+          useHarrisDetector,
+          k
+        );
+        mask.delete();
+
+        gray.copyTo(prevGray);
+        statusEl.textContent = 'Punti iniziali trovati. Muoviti lentamente...';
+        return;
+      }
+
+      // Optical flow
+      currPts = new cv.Mat();
+      if (!ofErr) ofErr = new cv.Mat();
+
+      cv.calcOpticalFlowPyrLK(
+        prevGray,
+        gray,
+        prevPts,
+        currPts,
+        ofStatus,
+        ofErr
+      );
+
+      const goodPrev = [];
+      const goodCurr = [];
+
+      for (let i = 0; i < ofStatus.rows; i++) {
+        if (ofStatus.ucharPtr(i, 0)[0] === 1) {
+          const px = prevPts.floatAt(i, 0);
+          const py = prevPts.floatAt(i, 1);
+          const cx2 = currPts.floatAt(i, 0);
+          const cy2 = currPts.floatAt(i, 1);
+          goodPrev.push({ x: px, y: py });
+          goodCurr.push({ x: cx2, y: cy2 });
+        }
+      }
+
+      const nPoints = goodPrev.length;
+      if (nPoints < 20) {
+        // Troppi pochi punti -> ricalcolo
+        prevPts.delete();
+        prevPts = null;
+        currPts.delete();
+        gray.copyTo(prevGray);
+        statusEl.textContent = 'Pochi punti tracciati, ricerco feature...';
+        return;
+      }
+
+      // Parallasse → pseudo profondità
+      // Più il movimento è grande, più il punto viene considerato vicino
+      const depthScale = 0.5; // scala globale
+      for (let i = 0; i < nPoints; i++) {
+        const p0 = goodPrev[i];
+        const p1 = goodCurr[i];
+
+        const dx = p1.x - p0.x;
+        const dy = p1.y - p0.y;
+        const motion = Math.sqrt(dx*dx + dy*dy);
+
+        // Depth inversa: più movimento = più vicino → z piccolo
+        // evitiamo divisione per zero
+        const eps = 0.01;
+        const invDepth = 1.0 / (motion + eps);
+
+        // Coord normalizzate in [-1,1] rispetto al centro
+        const nx = (p1.x - cx) / cx;
+        const ny = (p1.y - cy) / cy;
+
+        const z = depthScale * invDepth; // pseudo profondità
+        const X = nx * z;
+        const Y = -ny * z; // invertiamo l'asse y per coerenza
+
+        add3DPoint(X, Y, z);
+      }
+
+      // Preparati per frame successivo
+      prevPts.delete();
+      prevPts = currPts;
+      gray.copyTo(prevGray);
+
+      statusEl.textContent = `Punti 3D: ${pointCount} | Tracked features: ${nPoints}`;
     }
-    cv.gemm(Ktri, Rt0, 1, null, 0, P0);
-    Rt0.delete();
-  }
-
-  // P1 = Ktri [R_cum_new | t_cum_new]
-  const Rt1 = new cv.Mat(3, 4, cv.CV_64F);
-  for (let r = 0; r < 3; r++) {
-    for (let c = 0; c < 3; c++) {
-      Rt1.doublePtr(r, c)[0] = R_cum_new.doublePtr(r, c)[0];
-    }
-    Rt1.doublePtr(r, 3)[0] = t_cum_new.doublePtr(r, 0)[0];
-  }
-  const P1 = new cv.Mat(3, 4, cv.CV_64F);
-  cv.gemm(Ktri, Rt1, 1, null, 0, P1);
-
-  const points4D = new cv.Mat();
-  cv.triangulatePoints(P0, P1, prevMat, currMat, points4D);
-
-  // Aggiungi punti alla nuvola 3D (coordinate omogenee → 3D)
-  for (let i = 0; i < points4D.cols; i++) {
-    const x = points4D.floatAt(0, i);
-    const y = points4D.floatAt(1, i);
-    const z = points4D.floatAt(2, i);
-    const w = points4D.floatAt(3, i);
-
-    if (Math.abs(w) > 1e-5) {
-      const X = x / w;
-      const Y = y / w;
-      const Z = z / w;
-
-      const scale = 0.2; // scala arbitraria per tenerlo compatto
-      add3DPoint(X * scale, -Y * scale, Z * scale);
-    }
-  }
-
-  // Cleanup triangolazione
-  points4D.delete();
-  P0.delete();
-  P1.delete();
-  Rt1.delete();
-  I.delete();
-  zero3.delete();
-  Ktri.delete();
-
-  // Aggiorna cumulativi
-  if (R_cumulative) R_cumulative.delete();
-  if (t_cumulative) t_cumulative.delete();
-  R_cumulative = R_cum_new;
-  t_cumulative = t_cum_new;
-
-  // Cleanup punti & frame
-  prevMat.delete();
-  currMat.delete();
-  prevPts.delete();
-  prevPts = currPts; // le correnti diventano le precedenti
-  gray.copyTo(prevGray);
-
-  statusEl.textContent = `Punti 3D: ${pointCount} | Tracked features: ${nPoints}`;
-}
-
 
     // ==============================
     // CLEANUP
@@ -603,10 +445,8 @@
         if (prevGray) prevGray.delete();
         if (prevPts) prevPts.delete();
         if (currPts) currPts.delete();
-        if (status) status.delete();
-        if (err) err.delete();
-        if (R_cumulative) R_cumulative.delete();
-        if (t_cumulative) t_cumulative.delete();
+        if (ofStatus) ofStatus.delete();
+        if (ofErr) ofErr.delete();
       }
     });
 
