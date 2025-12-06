@@ -216,10 +216,9 @@
   videoCanvas = document.getElementById('videoCanvas');
   videoCtx = videoCanvas.getContext('2d');
 
-  // Prima tentiamo la camera posteriore
   const constraints = {
     video: {
-      facingMode: { ideal: 'environment' }  // preferisci la posteriore
+      facingMode: { ideal: 'environment' }  // prova a usare la posteriore
     },
     audio: false
   };
@@ -231,13 +230,13 @@
         videoCanvas.width = video.videoWidth;
         videoCanvas.height = video.videoHeight;
         streaming = true;
-        statusEl.textContent = 'Webcam attiva (posteriore se disponibile). Cerco il foglio A4...';
+        statusEl.textContent = 'Camera attiva. Cerco il foglio A4...';
       });
     })
     .catch((err) => {
-      console.warn('Camera posteriore non disponibile, provo fallback:', err);
+      console.warn('Camera posteriore non disponibile, uso qualsiasi camera:', err);
 
-      // Fallback: qualsiasi camera
+      // Fallback: qualsiasi camera disponibile
       return navigator.mediaDevices.getUserMedia({ video: true, audio: false });
     })
     .then((fallbackStream) => {
@@ -249,13 +248,13 @@
           videoCanvas.width = video.videoWidth;
           videoCanvas.height = video.videoHeight;
           streaming = true;
-          statusEl.textContent = 'Webcam attiva (fallback). Cerco il foglio A4...';
+          statusEl.textContent = 'Camera attiva (fallback). Cerco il foglio A4...';
         });
       }
     })
     .catch((err2) => {
-      console.error('Errore getUserMedia (anche fallback):', err2);
-      statusEl.textContent = 'Errore accesso webcam: ' + err2;
+      console.error('Errore getUserMedia:', err2);
+      statusEl.textContent = 'Errore accesso camera: ' + err2;
     });
 }
 
